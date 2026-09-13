@@ -1,0 +1,13 @@
+# dsh-cost-stats bundle patch.
+#
+# Mounts the pack as a loader row so the client-modules scanner sees its
+# `dsh.client` declaration and serves the browser half. The row is a plain
+# plugin with no configuration: the whole feature (the per-turn cost chip and
+# the "Расход" conversation view tab) registers in the browser against the
+# official DSH slot / locale registries, so no upstream file is touched.
+#
+# The id is the row's stable handle; the user's profile cordis.patch.yml may
+# address or disable it by this id.
+- insert:
+    - id: cost-stats
+      name: dsh-cost-stats
