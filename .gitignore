@@ -1,5 +1,17 @@
+# Local material: never publish any of it.
 node_modules/
-graphify-out/
+.tmp/
 *.log
+
+# Provider billing exports used by tools/verify-billing.mjs — user data.
+usage_data_*.zip
+
+# Internal development history, kept local.
+HANDOFF.md
+
+# Editor / OS noise
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
+desktop.ini

@@ -52,6 +52,10 @@ const React = {
   useState(initial) {
     const frame = frames[frames.length - 1]
     const index = frame.index++
+    // A test may seed a component's state (see `stateSeeds`): the harness renders each
+    // component once, so a closed popover could never be asserted open otherwise.
+    const seed = frame.seed === undefined ? undefined : frame.seed[index]
+    if (seed !== undefined) frame.state[index] = seed
     if (!(index in frame.state)) frame.state[index] = typeof initial === 'function' ? initial() : initial
     const set = (value) => {
       frame.state[index] = typeof value === 'function' ? value(frame.state[index]) : value
@@ -91,8 +95,24 @@ const React = {
 
 /** Walk one element tree, collecting visible text and selected attributes. */
 
+/**
+ * The session summary polls the account balance on an interval; a real timer would
+ * keep Node alive after the last assertion, and a real fetch has nowhere to go. Both
+ * are stubbed here: the components must cope with a route that never answers.
+ */
+globalThis.setInterval = () => 0
+globalThis.clearInterval = () => {}
+
 /** Hook count per component function, across every render this run performed. */
 const hookCounts = new Map()
+
+/**
+ * State a component should start with, keyed by the component function or by its name
+ * (internal components have no reference to key on), then by hook slot. The harness
+ * renders each component once, so anything behind a click (the cost breakdown popover)
+ * can only be reached by seeding its state.
+ */
+const stateSeeds = new Map()
 
 /** Count one hook call against the current frame (used by the mocked shell hooks). */
 function bumpHook() {
@@ -138,7 +158,8 @@ function walk(node, text, attrs) {
     return
   }
   if (typeof node.type === 'function') {
-    const frame = { index: 0, state: [], memo: [] }
+    const seed = stateSeeds.get(node.type) ?? stateSeeds.get(node.type.name)
+    const frame = { index: 0, state: [], memo: [], seed: seed }
     frames.push(frame)
     let produced
     try {
@@ -484,10 +505,11 @@ assert(ledger.turns.length === 3, 'folds three turns')
 assert(ledger.turns[0].turn === 1 && ledger.turns[2].turn === 3, 'orders turns ascending')
 assert(ledger.turns[0].wallMs === 1_700, 'derives turn wall time from the timeline')
 // turn 1: 12000 miss * 0.27 + 40000 hit * 0.07 + 2000 out * 1.10, all /1e6
-// Tariff under test: flash 0.27 / 0.00 / 1.10, pro 0.55 / 0.00 / 2.19 — cached
-// input is not charged, which is what the audit of the real logs established.
+// Tariff under test: flash 0.27 / 0.00 / 1.10, pro 1.32 / 0.044 / 3.96. The pro row is
+// the provider's own billing export: it charges cache reads, and its miss/output rates
+// sit above the published DeepSeek ones.
 const expectedTurnOne = (12_000 * 0.27 + 40_000 * 0.0 + 2_000 * 1.1) / 1e6
-const expectedTurnTwo = (5_000 * 0.55 + 1_000 * 2.19) / 1e6
+const expectedTurnTwo = (5_000 * 1.32 + 1_000 * 3.96) / 1e6
 // turn 3 is rebuilt from its two steps: 3000 miss, 3000 cache read, 1500 out at flash
 const expectedTurnThree = (3_000 * 0.27 + 3_000 * 0.0 + 1_500 * 1.1) / 1e6
 const round = (value) => Number(value.toFixed(9))
@@ -504,26 +526,39 @@ assert(ledger.totals.reasoning === 800, 'reasoning tokens are tracked separately
 assert(ledger.totals.cacheHitPercent === 68, 'cache hit percent is hit / (hit + miss)')
 assert(ledger.requests.length === 3, 'keeps one ledger row per settled request')
 assert(ledger.totals.requests === 3, 'counts requests')
-assert(round(ledger.blend.miss) === round((3_240 + 2_750 + 810) / 20_000), 'blends a token-weighted miss tariff')
+assert(round(ledger.blend.miss) === round((3_240 + 6_600 + 810) / 20_000), 'blends a token-weighted miss tariff')
 assert(ledger.tools.length === 3, 'collects tools, nested calls included')
 assert(ledger.tools[0].name === 'read' && ledger.tools[1].name === 'pwsh', 'keeps tool order by call count')
 assert(ledger.tools[0].ms === 500 && ledger.tools[1].errors === 1, 'records tool duration and errors')
-assert(ledger.models.length === 3 && ledger.models[0].model === 'deepseek-flash', 'ranks models by cost')
+assert(
+  ledger.models.length === 3 &&
+    ledger.models[0].model === 'deepseek-v4-pro' &&
+    ledger.models[0].usd >= ledger.models[1].usd,
+  'ranks models by cost, most expensive first'
+)
 
 /* ── the chat chip ───────────────────────────────────────────────────────── */
 
-const owner = { turn: { data: { get: (key) => (key === 'turn-tail' ? turnOne : undefined) } } }
+/* 0.2.0 turned `conversation.chat.turnTail` into a list seat: it takes no chain
+ * selector, so the entry carries its own id and the former selector runs inside the
+ * component. Every claim below is therefore observed through a render. */
+assert(tailSlot.definition.id === 'cost-stats', 'the turn-tail seat is a list entry with its own id')
+
+/** One TurnLocation carrying the tail the chat node published for the turn. */
+const location = (tail) => ({ data: { get: (key) => (key === 'turn-tail' ? tail : undefined) } })
+/** The owner props a list seat hands its entry. */
+const seatProps = (tail) => ({ turn: location(tail), t: ctx.locale.bind('cost'), useCost: mockUseCost(ledger) })
+
+const declinedByAction = render(React.createElement(tailSlot.component, seatProps(turnOne)))
 assert(
-  tailSlot.definition.select(owner) === null,
-  'the chain seat declines a turn the message action list will price (no duplication)'
+  declinedByAction.text.trim() === '',
+  'the turn-tail entry declines a turn the message action list will price (no duplication)'
 )
-assert(
-  tailSlot.definition.select({ turn: { data: { get: () => undefined } } }) === null,
-  'the chain seat declines a turn with no tail at all'
-)
+const declinedEmpty = render(React.createElement(tailSlot.component, seatProps(undefined)))
+assert(declinedEmpty.text.trim() === '', 'the turn-tail entry declines a turn with no tail at all')
 
 // A turn whose tail has no closing assistant has no action row to attach to, so the
-// chain seat is the only place its cost can appear.
+// turn-tail entry is the only place its cost can appear.
 const chainedTail = {
   turn: 4,
   seq: 45,
@@ -538,38 +573,38 @@ const chainedTail = {
     routes: [{ provider: 'deepseek-official', model: 'deepseek-flash' }]
   }
 }
-const chained = tailSlot.definition.select({ turn: { data: { get: () => chainedTail } } })
-assert(chained !== null && chained.turn === 4, 'the chain seat claims a turn that has no action row')
-assert(chained.exact !== null, 'the chain seat prices the turn exactly when the tail carries usage')
-
-const claimed = tailSlot.definition.select({ turn: { data: { get: () => ({ turn: 3, closing: null }) } } })
-assert(claimed !== null && claimed.exact === null, 'the chain seat still claims a turn only the ledger can price')
+const ledgerOnlyTail = { turn: 3, closing: null }
 
 assert(ledger.byMessage.get('m-1') === 1, 'maps the closing assistant message to its turn')
 assert(ledger.byTurn.get(1) === ledger.turns[0], 'indexes turns by number')
 
-const chip = render(
-  React.createElement(tailSlot.component, { matched: chained, t: ctx.locale.bind('cost'), useCost: mockUseCost(ledger) })
-)
-assert(chip.text.includes('$.0008'), 'the chip shows the turn price, without a leading zero')
+const chip = render(React.createElement(tailSlot.component, seatProps(chainedTail)))
+assert(chip.text.includes('$0.0008'), 'the chip shows the turn price with its leading zero')
 assert(chip.text.includes('1.50k'), 'the chip shows the total token count')
 
 const approximateChip = render(
-  React.createElement(tailSlot.component, {
-    matched: claimed,
-    t: ctx.locale.bind('cost'),
-    useCost: mockUseCost(ledger)
-  })
+  React.createElement(tailSlot.component, seatProps(ledgerOnlyTail))
 )
-assert(approximateChip.text.includes('≈ $.0025'), 'the chip prices a ledger-rebuilt turn with ≈')
+assert(approximateChip.text.includes('≈ $0.0025'), 'the chip prices a ledger-rebuilt turn with ≈')
+
+/* ── the cost breakdown popover ──────────────────────────────────────────── */
+
+// The pill opens a breakdown. In the browser that panel is portalled to `document.body`
+// and placed with a fixed position, because the chat's message rows are stacking
+// contexts of their own — an absolutely positioned panel sank beneath the next row.
+// Here there is no DOM, so `FloatingLayer` must still yield the same children.
+stateSeeds.set('CostPill', { 0: true })
+const openChip = render(
+  React.createElement(tailSlot.component, seatProps(chainedTail))
+)
+stateSeeds.delete('CostPill')
+assert(openChip.text.includes('Модель: deepseek-flash'), 'the opened pill names the model')
+assert(openChip.text.includes('Оценка'), 'the opened pill says the figure is an estimate')
+assert(openChip.text.includes('Разбивки по действиям нет'), 'a rebuilt turn without requests says so')
 assert(approximateChip.attrs.some((value) => value.includes('ход собран из запросов')), 'the chip explains the ≈')
 
 const blindChip = render(
-  React.createElement(tailSlot.component, {
-    matched: { turn: 99, exact: null, mixed: false },
-    t: ctx.locale.bind('cost'),
-    useCost: mockUseCost(ledger)
-  })
+  React.createElement(tailSlot.component, seatProps({ turn: 99, closing: null }))
 )
 assert(blindChip.text.trim() === '', 'the chip renders nothing for a turn the ledger cannot price')
 
@@ -585,11 +620,24 @@ const action = render(
     useCost: mockUseCost(ledger)
   })
 )
-assert(action.text.includes('$.0054'), 'the message action prices the closing message turn')
+assert(action.text.includes('$0.0054'), 'the message action prices the closing message turn')
 assert(action.attrs.includes('IconSettingsOutline16'), 'the message action labels tools with the shell gear icon')
 assert(action.attrs.some((value) => value.includes('Инструменты')), 'the message action keeps the label in its tooltip')
 assert(!action.attrs.some((value) => value.includes('Чтение и анализ')), 'the message action omits a category with no spend')
 assert(!action.text.includes('Инструменты'), 'the message action carries no word labels in the row')
+
+// Same seat, panel open: the breakdown must reach the reader there too.
+stateSeeds.set('CostPill', { 0: true })
+const openAction = render(
+  React.createElement(actionSlot.component, {
+    messageId: 'm-1',
+    t: ctx.locale.bind('cost'),
+    useCost: mockUseCost(ledger)
+  })
+)
+stateSeeds.delete('CostPill')
+assert(openAction.text.includes('Инструменты'), 'the opened action row breaks the spend down by action')
+assert(openAction.text.includes('Размышления'), 'the opened action row lists every category')
 
 /* ── the session summary under the composer ──────────────────────────────── */
 
@@ -606,7 +654,7 @@ const summary = render(
     useProjection: mockUseProjection(() => undefined)
   })
 )
-assert(summary.text.includes('$.0128'), 'the session summary shows the whole-session cost')
+assert(summary.text.includes('$0.0185'), 'the session summary shows the whole-session cost')
 assert(summary.attrs.includes('IconSettingsOutline16'), 'the session summary reuses the category icons')
 assert(summary.attrs.includes('IconThinkOutline14'), 'the session summary shows reasoning spend')
 assert(summary.attrs.includes('IconBrowseOutline16'), 'the session summary shows reading spend')
@@ -662,7 +710,7 @@ const view = render(
 )
 
 assert(view.text.includes('Расход и статистика'), 'the tab renders its title')
-assert(view.text.includes('$.0128'), 'the tab shows the total cost of the loaded turns')
+assert(view.text.includes('$0.0185'), 'the tab shows the total cost of the loaded turns')
 assert(view.text.includes('Ввод из кэша'), 'the tab renders the bucket breakdown')
 assert(view.text.includes('Рейтинг: самые дорогие ходы'), 'the tab renders the turn rating')
 assert(view.text.includes('Рейтинг инструментов'), 'the tab renders the tool rating')
@@ -679,6 +727,38 @@ assert(view.text.includes('1 мин') && view.text.includes('10 с'), 'the timel
 assert(view.text.includes('Средний темп') && view.text.includes('Пик'), 'the timeline summarises the visible window')
 assert(view.text.includes('перетаскивание'), 'the timeline explains its own gestures')
 assert(view.text.includes('/мин'), 'rates carry the per-minute unit')
+
+/* ── ranges, idle compression and the long-range source ──────────────────── */
+
+assert(
+  ['1 ч', '6 ч', '24 ч', '7 дн', 'Всё'].every((label) => view.text.includes(label)),
+  'the timeline offers hour and day ranges'
+)
+assert(view.text.includes('Сжимать простои'), 'the timeline can compress idle stretches')
+assert(view.text.includes('авто'), 'the timeline picks a bucket width automatically')
+assert(view.text.includes('Источник:'), 'the timeline names where its data came from')
+
+// Two requests two hours apart: everything between them is idle, and that run must
+// collapse into a single slot instead of owning most of the axis.
+const twoHours = 2 * 3600000
+const gappyStats = {
+  ...ledger,
+  requests: [
+    { time: 1000, model: 'deepseek-flash', category: 'tools', cost: ledger.requests[0].cost },
+    { time: 1000 + twoHours, model: 'deepseek-flash', category: 'tools', cost: ledger.requests[0].cost }
+  ]
+}
+const gappyView = render(
+  React.createElement(viewSlot.component, {
+    t: ctx.locale.bind('cost'),
+    useCost: mockUseCost(gappyStats),
+    useProjection: mockUseProjection(projections),
+    useSession: mockUseHook({ hasMore: false }),
+    sessionId: 's1'
+  })
+)
+assert(gappyView.text.includes('Простоев: 1'), 'an idle stretch collapses into a single gap slot')
+assert(gappyView.text.includes('Запросов: 2'), 'the collapsed window still counts both requests')
 
 /* ── the timeline arithmetic ─────────────────────────────────────────────── */
 

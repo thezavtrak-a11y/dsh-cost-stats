@@ -8,23 +8,29 @@
  * table is wrong; if the token sums disagree, the plugin is miscounting.
  *
  * Usage:
- *   node tools/audit-usage.mjs                       # every session, per model + total
- *   node tools/audit-usage.mjs --session <id-prefix> # one session only
- *   node tools/audit-usage.mjs --target 5            # solve the implied $/M for a target bill
- *
- * Logs are read from `$DSH_HOME/sessions` when `DSH_HOME` is set, otherwise from
- * `~/.dsh/sessions`; `--root <dir>` overrides both.
+ *   node tools/audit-usage.mjs                     # every session, per model + total
+ *   node tools/audit-usage.mjs --session 3bc430b7  # one session only
+ *   node tools/audit-usage.mjs --target 4.47       # solve the implied $/M for a target bill
+ *   node tools/audit-usage.mjs --root <dir>        # another DSH home (default: $DSH_HOME, else ~/.dsh)
+ *   node tools/audit-usage.mjs --sessions <dir>    # point straight at one session-log tree
  */
 
-import { readFileSync, readdirSync, statSync } from 'node:fs'
-import { zstdDecompressSync } from 'node:zlib'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { zstdDecompressSync } from 'node:zlib'
 import { join } from 'node:path'
 
-const argsAll = process.argv.slice(2)
-const rootArg = argsAll.indexOf('--root')
-const DSH_HOME = rootArg === -1 ? process.env.DSH_HOME ?? join(homedir(), '.dsh') : argsAll[rootArg + 1]
-const SESSION_ROOT = join(DSH_HOME, 'sessions')
+const argv = process.argv.slice(2)
+const flag = (name) => {
+  const index = argv.indexOf(`--${name}`)
+  return index === -1 || argv[index + 1] === undefined ? undefined : argv[index + 1]
+}
+
+/* Nothing here is tied to one machine: the DSH home comes from `--root`, then
+   `$DSH_HOME`, then `~/.dsh`, and the session logs plus the title projection cache
+   both live under it. */
+const DSH_HOME = flag('root') ?? process.env.DSH_HOME ?? join(homedir(), '.dsh')
+const SESSION_ROOT = flag('sessions') ?? join(DSH_HOME, 'sessions')
 const SESSION_TITLES_ROOT = join(DSH_HOME, 'storages', 'session_projcache', 'sessions')
 const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
 
@@ -33,8 +39,8 @@ const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
 // Cached input is not charged on this plan: see the calibration note in
 // lib/client.js. Keep these four rows identical to that table.
 const PRICES = {
-  'deepseek-v4-pro': { miss: 0.55, hit: 0, write: 0.55, out: 2.19 },
-  'deepseek-reasoner': { miss: 0.55, hit: 0, write: 0.55, out: 2.19 },
+  'deepseek-v4-pro': { miss: 1.32, hit: 0.044, write: 1.32, out: 3.96 },
+  'deepseek-reasoner': { miss: 1.32, hit: 0.044, write: 1.32, out: 3.96 },
   'deepseek-v4-flash': { miss: 0.27, hit: 0, write: 0.27, out: 1.1 },
   'deepseek-v4-flash-vision-exp': { miss: 0.27, hit: 0, write: 0.27, out: 1.1 },
   'deepseek-flash': { miss: 0.27, hit: 0, write: 0.27, out: 1.1 },
@@ -206,15 +212,19 @@ const fmtUsd = (value) => {
   return '$' + text
 }
 
-const args = process.argv.slice(2)
-const sessionArg = args.indexOf('--session')
-const targetArg = args.indexOf('--target')
-const sessionFilter = sessionArg === -1 ? undefined : args[sessionArg + 1]
-const target = targetArg === -1 ? undefined : Number(args[targetArg + 1])
+const sessionFilter = flag('session')
+const target = Number(flag('target'))
+
+if (!existsSync(SESSION_ROOT)) {
+  console.error(`\nno session logs at ${SESSION_ROOT}`)
+  console.error('pass --root <DSH home>, --sessions <session-log tree>, or set DSH_HOME')
+  process.exit(1)
+}
 
 const result = audit({ sessionFilter })
 
-console.log(`\nSession logs read: ${String(result.files)}${sessionFilter === undefined ? '' : ` (filter "${sessionFilter}")`}`)
+console.log(`\nlogs root: ${SESSION_ROOT}`)
+console.log(`Session logs read: ${String(result.files)}${sessionFilter === undefined ? '' : ` (filter "${sessionFilter}")`}`)
 console.log(`assistant/message records: ${String(result.usageMessages)} with usage, ${String(result.messagesWithoutUsage)} without\n`)
 
 const rows = [...result.byModel.entries()].sort((a, b) => b[1].cost - a[1].cost)
